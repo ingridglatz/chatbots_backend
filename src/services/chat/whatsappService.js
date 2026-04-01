@@ -118,6 +118,7 @@ const processIncomingMessage = async (payload) => {
             t.plan, t.status AS "tenantStatus",
             t.messages_this_month AS "msgCount",
             t.ai_provider, t.anthropic_api_key_enc, t.ai_model,
+            t.operator_whatsapp AS "operatorWhatsapp",
             pl.max_messages_per_month AS "msgLimit"
      FROM bots b
      JOIN tenants t ON t.id = b.tenant_id
@@ -184,6 +185,14 @@ const processIncomingMessage = async (payload) => {
         "Entendido! 👋 Vou chamar um atendente. Aguarde um momento!";
       await sendText(instance, remoteJid, transferMsg);
       await saveMessage(conversation.id, "system", transferMsg);
+
+      // Notifica o operador via WhatsApp se tiver número cadastrado
+      if (bot.operatorWhatsapp) {
+        const operatorJid = `${bot.operatorWhatsapp}@s.whatsapp.net`;
+        const contactDisplay = contactName || phone;
+        const notifMsg = `🔔 *Novo atendimento solicitado!*\n\nCliente: *${contactDisplay}*\nBot: *${bot.name}*\n\nAcesse o painel para atender.`;
+        sendText(instance, operatorJid, notifMsg).catch(() => {});
+      }
       return;
     }
 

@@ -37,6 +37,9 @@ router.get("/settings/ai", tenantController.getAISettings);
 router.post("/settings/ai", tenantController.saveAISettings);
 router.delete("/settings/ai/key", tenantController.removeCustomKey);
 
+router.get("/conversations/waiting-count", tenantController.getWaitingCount);
+router.post("/settings/operator-phone", tenantController.saveOperatorPhone);
+
 router.get("/users", requireRole("owner", "admin"), tenantController.listUsers);
 router.post("/users/invite", requireRole("owner"), tenantController.inviteUser);
 router.delete(

@@ -1,0 +1,5 @@
+-- Migração: integração com Asaas
+ALTER TABLE tenants
+  ADD COLUMN IF NOT EXISTS asaas_customer_id VARCHAR(100) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS asaas_subscription_id VARCHAR(100) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS next_billing_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;

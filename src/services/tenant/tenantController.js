@@ -330,8 +330,6 @@ exports.health = async (req, res, next) => {
   }
 };
 
-// ── WhatsApp endpoints ────────────────────────────────────────────────────────
-
 exports.connectWhatsApp = async (req, res, next) => {
   try {
     const botResult = await query(
@@ -343,7 +341,6 @@ exports.connectWhatsApp = async (req, res, next) => {
     const bot = botResult.rows[0];
     const instanceId = bot.whatsapp_instance || req.params.id;
 
-    // Garante que o bot tem whatsapp_instance definido
     if (!bot.whatsapp_instance) {
       await query("UPDATE bots SET whatsapp_instance = $1 WHERE id = $2", [
         instanceId,
@@ -506,6 +503,32 @@ exports.saveAISettings = async (req, res, next) => {
     invalidateTenantCache(req.tenant.id);
 
     res.json(success(null, "Configurações de IA salvas com sucesso"));
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getWaitingCount = async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT COUNT(*) AS count FROM conversations WHERE tenant_id = $1 AND status = 'waiting'`,
+      [req.tenant.id],
+    );
+    res.json(success({ count: parseInt(result.rows[0].count) }));
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.saveOperatorPhone = async (req, res, next) => {
+  try {
+    const { phone } = req.body;
+    const cleaned = (phone || "").replace(/\D/g, "");
+    await query("UPDATE tenants SET operator_whatsapp = $1 WHERE id = $2", [
+      cleaned || null,
+      req.tenant.id,
+    ]);
+    res.json(success(null, "Telefone do operador salvo"));
   } catch (err) {
     next(err);
   }
