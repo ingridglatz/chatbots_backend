@@ -16,14 +16,13 @@ const injectTenant = async (req, res, next) => {
 
     const result = await query(
       `SELECT t.id, t.name, t.segment, t.plan, t.status,
-              t.message_count_this_month AS "messageCountThisMonth",
+              t.messages_this_month AS "messageCountThisMonth",
               t.created_at AS "createdAt",
-              pl.bot_limit AS "botLimit",
-              pl.message_limit AS "messageLimit",
-              pl.whatsapp_enabled AS "whatsappEnabled"
+              pl.max_bots AS "botLimit",
+              pl.max_messages_per_month AS "messageLimit"
        FROM tenants t
-       JOIN plans pl ON pl.name = t.plan
-       WHERE t.id = $1 AND t.status = 'active'`,
+       JOIN plans pl ON pl.id = t.plan
+       WHERE t.id = $1 AND t.status != 'suspended'`,
       [tenantId]
     );
 

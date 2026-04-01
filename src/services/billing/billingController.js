@@ -81,7 +81,7 @@ exports.listInvoices = async (req, res, next) => {
 
 exports.getUsage = async (req, res, next) => {
   try {
-    const result = await query(`SELECT (SELECT COUNT(*) FROM bots WHERE tenant_id = $1) AS "botsUsed", message_count_this_month AS "messagesUsed" FROM tenants WHERE id = $1`, [req.tenant.id]);
+    const result = await query(`SELECT (SELECT COUNT(*) FROM bots WHERE tenant_id = $1) AS "botsUsed", messages_this_month AS "messagesUsed" FROM tenants WHERE id = $1`, [req.tenant.id]);
     res.json(success({ botsUsed: parseInt(result.rows[0].botsUsed), messagesUsed: parseInt(result.rows[0].messagesUsed), botLimit: req.tenant.botLimit, messageLimit: req.tenant.messageLimit }));
   } catch (err) { next(err); }
 };

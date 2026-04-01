@@ -26,10 +26,11 @@ router.get('/health', async (req, res) => {
   res.status(isHealthy ? 200 : 503).json(success(status, isHealthy ? 'Todos os serviços operacionais' : 'Degradado'));
 });
 
-router.use('/api/chat',    require('../services/chat'));
-router.use('/api/tenant',  require('../services/tenant'));
-router.use('/api/billing', require('../services/billing'));
-router.use('/webhooks',    require('../webhooks'));
+router.use('/api/chat',          require('../services/chat'));
+router.use('/api/tenant',        require('../services/tenant'));
+router.use('/api/billing',       require('../services/billing'));
+router.use('/api/tenant',        require('../services/conversations'));
+router.use('/webhooks',          require('../webhooks'));
 
 router.use((req, res) => {
   res.status(404).json({ success: false, message: `Rota não encontrada: ${req.method} ${req.originalUrl}`, code: 'NOT_FOUND' });

@@ -1,127 +1,264 @@
-const Anthropic = require('@anthropic-ai/sdk');
-const { query } = require('../../models/db');
-const { get, set } = require('../../models/redis');
-const logger = require('../../utils/logger');
+const { query } = require("../../models/db");
+const { get, set } = require("../../models/redis");
+const logger = require("../../utils/logger");
+const { getAIClient } = require("../../utils/aiClient");
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const EVOLUTION_URL = (process.env.EVOLUTION_API_URL || 'http://localhost:8080').replace(/\/$/, '');
-const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY || '';
 const SESSION_TTL = 60 * 60;
-const MAX_RETRIES = 2;
 
-const evolutionFetch = async (path, body, retries = 0) => {
-  const url = `${EVOLUTION_URL}${path}`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const text = await res.text(); throw new Error(`Evolution API ${res.status}: ${text}`); }
-    return await res.json();
-  } catch (err) {
-    if (retries < MAX_RETRIES) {
-      await new Promise((r) => setTimeout(r, 800 * (retries + 1)));
-      return evolutionFetch(path, body, retries + 1);
-    }
-    throw err;
-  }
+const processingLocks = new Map();
+const acquireLock = async (key) => {
+  if (processingLocks.get(key)) return false;
+  processingLocks.set(key, true);
+  return true;
+};
+const releaseLock = (key) => processingLocks.delete(key);
+
+const wantsHumanAgent = (text, phrasesConfig) => {
+  const normalized = text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const phrases = (
+    phrasesConfig ||
+    "atendente,humano,pessoa,falar com alguem,quero atendimento,suporte humano"
+  )
+    .split(",")
+    .map((p) =>
+      p
+        .trim()
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, ""),
+    )
+    .filter(Boolean);
+  return phrases.some((phrase) => normalized.includes(phrase));
 };
 
-const sendText = async (instance, to, text) => {
+const sendText = async (instanceId, to, text) => {
+  const { getWAClient } = require("../whatsapp/whatsappManager");
+  const client = getWAClient(instanceId);
+  if (!client) {
+    logger.warn("Cliente WhatsApp não encontrado", { instanceId });
+    return;
+  }
+
   const chunks = splitLongMessage(text, 4000);
   for (const chunk of chunks) {
-    await evolutionFetch(`/message/sendText/${instance}`, {
-      number: to,
-      options: { delay: 500, presence: 'composing' },
-      textMessage: { text: chunk },
-    });
+    await client.sendMessage(to, chunk);
     if (chunks.length > 1) await new Promise((r) => setTimeout(r, 600));
   }
 };
 
-const sendTyping = async (instance, to, durationMs = 2000) => {
+const sendTyping = async (instanceId, to, durationMs = 2000) => {
   try {
-    await evolutionFetch(`/chat/sendPresence/${instance}`, {
-      number: to, options: { presence: 'composing', delay: durationMs },
-    });
-  } catch (err) { logger.debug('Erro ao enviar typing indicator', { error: err.message }); }
+    const { getWAClient } = require("../whatsapp/whatsappManager");
+    const client = getWAClient(instanceId);
+    if (!client) return;
+    const chat = await client.getChatById(to);
+    await chat.sendStateTyping();
+    await new Promise((r) => setTimeout(r, durationMs));
+    await chat.clearState();
+  } catch (err) {
+    logger.debug("Erro ao enviar typing indicator", { error: err.message });
+  }
 };
 
-const markAsRead = async (instance, remoteJid, messageId) => {
+const markAsRead = async (instanceId, to) => {
   try {
-    await evolutionFetch(`/chat/markMessageAsRead/${instance}`, {
-      readMessages: [{ remoteJid, fromMe: false, id: messageId }],
-    });
-  } catch (err) { logger.debug('Erro ao marcar mensagem como lida', { error: err.message }); }
+    const { getWAClient } = require("../whatsapp/whatsappManager");
+    const client = getWAClient(instanceId);
+    if (!client) return;
+    const chat = await client.getChatById(to);
+    await chat.sendSeen();
+  } catch (err) {
+    logger.debug("Erro ao marcar como lida", { error: err.message });
+  }
+};
+
+const upsertConversation = async (botId, tenantId, phone, contactName) => {
+  const res = await query(
+    `INSERT INTO conversations (bot_id, tenant_id, phone, contact_name, last_message_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (bot_id, phone) DO UPDATE
+       SET last_message_at = NOW(),
+           contact_name = COALESCE(NULLIF($4, ''), conversations.contact_name)
+     RETURNING id, status`,
+    [botId, tenantId, phone, contactName || ""],
+  );
+  return res.rows[0];
+};
+
+const saveMessage = async (conversationId, role, content) => {
+  await query(
+    "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)",
+    [conversationId, role, content],
+  ).catch((err) =>
+    logger.error("Erro ao salvar mensagem", { error: err.message }),
+  );
 };
 
 const processIncomingMessage = async (payload) => {
   const { instance, data } = payload;
   const remoteJid = data?.key?.remoteJid;
-  const messageId = data?.key?.id;
   const text = extractMessageText(data);
   if (!text || data?.key?.fromMe) return;
 
-  logger.info('WhatsApp: mensagem recebida', { instance, from: remoteJid, preview: text.substring(0, 60) });
+  const contactName = data?.pushName || "";
+  logger.info("WhatsApp: mensagem recebida", {
+    instance,
+    from: remoteJid,
+    preview: text.substring(0, 60),
+  });
 
   const botResult = await query(
     `SELECT b.id, b.name, b.system_prompt, b.tenant_id AS "tenantId",
+            b.human_transfer_enabled AS "humanTransferEnabled",
+            b.human_transfer_phrases AS "humanTransferPhrases",
+            b.human_transfer_message AS "humanTransferMessage",
             t.plan, t.status AS "tenantStatus",
-            t.message_count_this_month AS "msgCount",
-            pl.message_limit AS "msgLimit"
+            t.messages_this_month AS "msgCount",
+            t.ai_provider, t.anthropic_api_key_enc, t.ai_model,
+            pl.max_messages_per_month AS "msgLimit"
      FROM bots b
      JOIN tenants t ON t.id = b.tenant_id
-     JOIN plans pl ON pl.name = t.plan
+     JOIN plans pl ON pl.id = t.plan
      WHERE b.whatsapp_instance = $1 AND b.active = true LIMIT 1`,
-    [instance]
+    [instance],
   );
-  if (!botResult.rows.length) { logger.warn('WhatsApp: instância sem bot ativo', { instance }); return; }
+
+  if (!botResult.rows.length) {
+    logger.warn("WhatsApp: nenhum bot ativo para essa instância", { instance });
+    return;
+  }
 
   const bot = botResult.rows[0];
-  if (bot.tenantStatus !== 'active') return;
-  if (bot.msgLimit !== null && bot.msgCount >= bot.msgLimit) {
-    await sendText(instance, remoteJid, 'Desculpe, atingimos o limite de mensagens do mês.');
+  if (bot.tenantStatus === "suspended") return;
+
+  const phone = remoteJid.replace("@s.whatsapp.net", "").replace("@g.us", "");
+  const lockKey = `${bot.id}:${phone}`;
+
+  const locked = await acquireLock(lockKey);
+  if (!locked) {
+    logger.info("WhatsApp: mensagem descartada (já processando)", { phone });
     return;
   }
 
-  await Promise.all([markAsRead(instance, remoteJid, messageId), sendTyping(instance, remoteJid, 2500)]);
-
-  const phone = remoteJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
-  const sessionKey = `whatsapp_session:${bot.tenantId}:${bot.id}:${phone}`;
-  const history = (await get(sessionKey)) || [];
-  history.push({ role: 'user', content: text });
-  const limitedHistory = history.slice(-40);
-
-  let reply;
   try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: bot.system_prompt || `Você é ${bot.name}, um assistente prestativo. Responda de forma concisa via WhatsApp.`,
-      messages: limitedHistory,
+    const conversation = await upsertConversation(
+      bot.id,
+      bot.tenantId,
+      phone,
+      contactName,
+    );
+
+    const freshStatus = await query(
+      "SELECT status FROM conversations WHERE id = $1",
+      [conversation.id],
+    );
+    const currentStatus = freshStatus.rows[0]?.status || conversation.status;
+
+    await saveMessage(conversation.id, "user", text);
+
+    if (currentStatus === "human" || currentStatus === "waiting") {
+      logger.info(`WhatsApp: conversa pausada (${currentStatus})`, {
+        conversationId: conversation.id,
+      });
+      await markAsRead(instance, remoteJid);
+      return;
+    }
+
+    if (
+      bot.humanTransferEnabled !== false &&
+      wantsHumanAgent(text, bot.humanTransferPhrases)
+    ) {
+      logger.info("WhatsApp: transferindo para atendente humano", {
+        conversationId: conversation.id,
+      });
+      await query("UPDATE conversations SET status = $1 WHERE id = $2", [
+        "waiting",
+        conversation.id,
+      ]);
+      await markAsRead(instance, remoteJid);
+      const transferMsg =
+        bot.humanTransferMessage ||
+        "Entendido! 👋 Vou chamar um atendente. Aguarde um momento!";
+      await sendText(instance, remoteJid, transferMsg);
+      await saveMessage(conversation.id, "system", transferMsg);
+      return;
+    }
+
+    if (bot.msgLimit !== -1 && bot.msgCount >= bot.msgLimit) {
+      const limitMsg = "Desculpe, atingimos o limite de mensagens do mês. 😔";
+      await sendText(instance, remoteJid, limitMsg);
+      await saveMessage(conversation.id, "assistant", limitMsg);
+      return;
+    }
+
+    await Promise.all([
+      markAsRead(instance, remoteJid),
+      sendTyping(instance, remoteJid, 2500),
+    ]);
+
+    const sessionKey = `whatsapp_session:${bot.tenantId}:${bot.id}:${phone}`;
+    const history = (await get(sessionKey)) || [];
+    history.push({ role: "user", content: text });
+    const limitedHistory = history.slice(-40);
+
+    let reply;
+    try {
+      const { client, model } = getAIClient(bot);
+      const response = await client.messages.create({
+        model,
+        max_tokens: 1024,
+        system:
+          bot.system_prompt ||
+          `Você é ${bot.name}, um assistente prestativo. Responda de forma concisa via WhatsApp.`,
+        messages: limitedHistory,
+      });
+      reply = response.content[0].text;
+    } catch (err) {
+      logger.error("WhatsApp: erro ao chamar Claude", { error: err.message });
+      await sendText(
+        instance,
+        remoteJid,
+        "Desculpe, ocorreu um erro interno. Tente novamente em instantes.",
+      );
+      return;
+    }
+
+    limitedHistory.push({ role: "assistant", content: reply });
+    await set(sessionKey, limitedHistory, SESSION_TTL);
+    await saveMessage(conversation.id, "assistant", reply);
+
+    query(
+      "UPDATE tenants SET messages_this_month = messages_this_month + 1 WHERE id = $1",
+      [bot.tenantId],
+    ).catch((err) =>
+      logger.error("WhatsApp: erro ao incrementar contador", {
+        error: err.message,
+      }),
+    );
+
+    await sendText(instance, remoteJid, reply);
+    logger.info("WhatsApp: resposta enviada", {
+      instance,
+      to: remoteJid,
+      botId: bot.id,
     });
-    reply = response.content[0].text;
-  } catch (err) {
-    logger.error('WhatsApp: erro ao chamar Claude', { error: err.message });
-    await sendText(instance, remoteJid, 'Desculpe, ocorreu um erro. Tente novamente em instantes.');
-    return;
+  } finally {
+    releaseLock(lockKey);
   }
-
-  limitedHistory.push({ role: 'assistant', content: reply });
-  await set(sessionKey, limitedHistory, SESSION_TTL);
-
-  query('UPDATE tenants SET message_count_this_month = message_count_this_month + 1 WHERE id = $1', [bot.tenantId])
-    .catch((err) => logger.error('WhatsApp: erro ao incrementar contador', { error: err.message }));
-
-  await sendText(instance, remoteJid, reply);
-  logger.info('WhatsApp: resposta enviada', { instance, to: remoteJid, botId: bot.id });
 };
 
 const extractMessageText = (data) => {
   const msg = data?.message;
   if (!msg) return null;
-  return msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.documentMessage?.caption || null;
+  return (
+    msg.conversation ||
+    msg.extendedTextMessage?.text ||
+    msg.imageMessage?.caption ||
+    null
+  );
 };
 
 const splitLongMessage = (text, maxLen) => {
@@ -131,9 +268,12 @@ const splitLongMessage = (text, maxLen) => {
   while (start < text.length) {
     let end = start + maxLen;
     if (end < text.length) {
-      const lastBreak = text.lastIndexOf('\n', end);
+      const lastBreak = text.lastIndexOf("\n", end);
       if (lastBreak > start) end = lastBreak + 1;
-      else { const lastSpace = text.lastIndexOf(' ', end); if (lastSpace > start) end = lastSpace + 1; }
+      else {
+        const lastSpace = text.lastIndexOf(" ", end);
+        if (lastSpace > start) end = lastSpace + 1;
+      }
     }
     chunks.push(text.slice(start, end).trim());
     start = end;

@@ -1,12 +1,11 @@
-const Anthropic = require('@anthropic-ai/sdk');
 const { z } = require('zod');
 const { get, set, getRedisClient } = require('../../models/redis');
 const { query } = require('../../models/db');
 const { success } = require('../../utils/response');
 const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
+const { getAIClient } = require('../../utils/aiClient');
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SESSION_TTL = 60 * 60;
 
 const sendMessageSchema = z.object({
@@ -36,8 +35,15 @@ exports.sendMessage = async (req, res, next) => {
     const history = (await get(sessionKey)) || [];
     history.push({ role: 'user', content: body.message });
 
-    const claudeResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+    // Usa chave do tenant se configurada, senão usa a da plataforma
+    const tenantWithKeys = await query(
+      'SELECT ai_provider, anthropic_api_key_enc, ai_model FROM tenants WHERE id = $1',
+      [tenant.id]
+    );
+    const { client, model } = getAIClient(tenantWithKeys.rows[0] || {});
+
+    const claudeResponse = await client.messages.create({
+      model,
       max_tokens: 1024,
       system: bot.system_prompt || `Você é ${bot.name}, um assistente útil e prestativo.`,
       messages: history,
@@ -47,7 +53,7 @@ exports.sendMessage = async (req, res, next) => {
     history.push({ role: 'assistant', content: assistantReply });
     await set(sessionKey, history, SESSION_TTL);
 
-    query('UPDATE tenants SET message_count_this_month = message_count_this_month + 1 WHERE id = $1', [tenant.id])
+    query('UPDATE tenants SET messages_this_month = messages_this_month + 1 WHERE id = $1', [tenant.id])
       .catch((err) => logger.error('Erro ao incrementar contador de mensagens', { error: err.message }));
 
     res.json(success({ reply: assistantReply, sessionId: body.sessionId, usage: claudeResponse.usage }, 'Mensagem processada com sucesso'));
